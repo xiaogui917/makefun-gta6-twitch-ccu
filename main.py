@@ -28,8 +28,8 @@ def round2(x: float) -> float | int:
 
 
 def parse_iso(ts: str) -> datetime.datetime:
-    """Parse an ISO 8601 UTC timestamp."""
-    return datetime.datetime.fromisoformat(ts)
+    """Parse an ISO 8601 UTC timestamp as naive UTC."""
+    return datetime.datetime.fromisoformat(ts).replace(tzinfo=None)
 
 
 def read_case(path: Path) -> dict:
@@ -39,9 +39,12 @@ def read_case(path: Path) -> dict:
 
 def build_hourly_series(comp: dict) -> dict[int, float]:
     """Extract release-day hourly viewer counts (hours 1..24)."""
-    day_start = parse_iso(comp["day_start"])
+    day_start_raw = comp.get("day_start")
+    if not day_start_raw:
+        return {}
+    day_start = parse_iso(day_start_raw)
     series: dict[int, float] = {}
-    for row in comp.get("hourly", []):
+    for row in comp.get("hourly") or []:
         diff_sec = (parse_iso(row["from"]) - day_start).total_seconds()
         if 0 <= diff_sec < 86400:
             h = 1 + int(diff_sec // 3600)
@@ -56,17 +59,21 @@ def collect_comparables(
 ) -> tuple[float, list[dict[int, float]], list[dict[int, float]]]:
     """Filter comparables into primary usable and fallback series."""
     game_name = case_data.get("game", {}).get("name", "")
-    known = case_data.get("known", [])
+    known = case_data.get("known") or []
     h1_row = next((k for k in known if k.get("hour") == 1), None)
-    p1 = max(1.0, float(h1_row["viewers"])) if h1_row and "viewers" in h1_row else 1.0
+    p1 = (
+        max(1.0, float(h1_row["viewers"]))
+        if h1_row and h1_row.get("viewers") is not None
+        else 1.0
+    )
 
     primary: list[dict[int, float]] = []
     fallback: list[dict[int, float]] = []
 
-    for comp in case_data.get("comparables", []):
+    for comp in case_data.get("comparables") or []:
         if comp.get("name") == game_name:
             continue
-        u = comp.get("unlock", "").lower()
+        u = (comp.get("unlock") or "").lower()
         if "not a launch" in u:
             continue
         skip_pri = "early access" in u or (
