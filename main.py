@@ -1,4 +1,4 @@
-"""GTA VI Twitch CCU forecast: comparables log-ratio regression."""
+"""GTA VI Twitch CCU forecast v2: comparables 3-feature log-ratio regression."""
 
 import datetime
 import json
@@ -37,27 +37,43 @@ def read_case(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def build_hourly_series(comp: dict) -> dict[int, float]:
-    """Extract release-day hourly viewer counts (hours 1..24)."""
+def extract_pre23(rows: list, day_start: datetime.datetime) -> float | None:
+    """Extract viewers from hourly row 1 hour before day_start."""
+    for row in rows:
+        ts = row.get("from")
+        if ts and (parse_iso(ts) - day_start).total_seconds() == -3600:
+            v = row.get("viewers")
+            if v is not None and float(v) > 0:
+                return float(v)
+    return None
+
+
+def build_hourly_series(comp: dict) -> tuple[dict[int, float], float | None]:
+    """Build release-day hourly series and extract pre23 viewers."""
     day_start_raw = comp.get("day_start")
     if not day_start_raw:
-        return {}
+        return {}, None
     day_start = parse_iso(day_start_raw)
     series: dict[int, float] = {}
+    pre23: float | None = None
     for row in comp.get("hourly") or []:
-        diff_sec = (parse_iso(row["from"]) - day_start).total_seconds()
-        if 0 <= diff_sec < 86400:
-            h = 1 + int(diff_sec // 3600)
-            v = row.get("viewers")
-            if v is not None and v > 0:
-                series[h] = float(v)
-    return series
+        ts = row.get("from")
+        if not ts:
+            continue
+        diff = (parse_iso(ts) - day_start).total_seconds()
+        v = row.get("viewers")
+        if v is not None and float(v) > 0:
+            if diff == -3600:
+                pre23 = float(v)
+            elif 0 <= diff < 86400:
+                series[1 + int(diff // 3600)] = float(v)
+    return series, pre23
 
 
 def collect_comparables(
     case_data: dict,
-) -> tuple[float, list[dict[int, float]], list[dict[int, float]]]:
-    """Filter comparables into primary usable and fallback series."""
+) -> tuple[float, float | None, list[tuple[dict[int, float], float | None]], list[dict[int, float]]]:
+    """Filter comparables and extract target prints."""
     game_name = case_data.get("game", {}).get("name", "")
     known = case_data.get("known") or []
     h1_row = next((k for k in known if k.get("hour") == 1), None)
@@ -66,8 +82,14 @@ def collect_comparables(
         if h1_row and h1_row.get("viewers") is not None
         else 1.0
     )
+    ds_raw = case_data.get("day_start")
+    target_pre23 = (
+        extract_pre23(case_data.get("history_hourly") or [], parse_iso(ds_raw))
+        if ds_raw
+        else None
+    )
 
-    primary: list[dict[int, float]] = []
+    primary: list[tuple[dict[int, float], float | None]] = []
     fallback: list[dict[int, float]] = []
 
     for comp in case_data.get("comparables") or []:
@@ -79,54 +101,101 @@ def collect_comparables(
         skip_pri = "early access" in u or (
             "simultaneous" in u and not ("midnight local" in u or "rolling" in u)
         )
-        series = build_hourly_series(comp)
+        series, comp_pre23 = build_hourly_series(comp)
         h1 = series.get(1)
         if h1 is None or h1 < 5000:
             continue
         fallback.append(series)
         if not skip_pri:
-            primary.append(series)
+            primary.append((series, comp_pre23))
 
-    return p1, primary, fallback
+    return p1, target_pre23, primary, fallback
+
+
+def solve_ols_3(xs: list[list[float]], ys: list[float]) -> list[float] | None:
+    """Solve 3-feature OLS normal equations with 1e-9 ridge and partial pivoting."""
+    n = len(ys)
+    a = [[0.0] * 3 for _ in range(3)]
+    b = [0.0] * 3
+    for i in range(n):
+        for j in range(3):
+            b[j] += xs[i][j] * ys[i]
+            for k in range(3):
+                a[j][k] += xs[i][j] * xs[i][k]
+    for j in range(3):
+        a[j][j] += 1e-9
+
+    aug = [a[i] + [b[i]] for i in range(3)]
+    for col in range(3):
+        p_row = max(range(col, 3), key=lambda r: abs(aug[r][col]))
+        if abs(aug[p_row][col]) < 1e-12:
+            return None
+        aug[col], aug[p_row] = aug[p_row], aug[col]
+        p_val = aug[col][col]
+        for r in range(col + 1, 3):
+            factor = aug[r][col] / p_val
+            for c in range(col, 4):
+                aug[r][c] -= factor * aug[col][c]
+
+    beta = [0.0] * 3
+    for r in range(2, -1, -1):
+        if abs(aug[r][r]) < 1e-12:
+            return None
+        s = aug[r][3] - sum(aug[r][c] * beta[c] for c in range(r + 1, 3))
+        beta[r] = s / aug[r][r]
+    return beta
 
 
 def forecast_hour(
     h: int,
     p1: float,
-    primary: list[dict[int, float]],
+    target_pre23: float | None,
+    primary: list[tuple[dict[int, float], float | None]],
     fallback: list[dict[int, float]],
 ) -> list[float | int]:
-    """Forecast quantiles for hour h using OLS log ratio or fallback."""
-    usable = [s for s in primary if h in s]
+    """Forecast quantiles for hour h using 3-feature OLS or fallback."""
+    usable = [(s, pre) for s, pre in primary if h in s]
+    fit_ok = False
     if len(usable) >= 6:
-        xs = [math.log(s[1]) for s in usable]
-        ys = [math.log(s[h] / s[1]) for s in usable]
-        n = len(xs)
-        x_bar = sum(xs) / n
-        y_bar = sum(ys) / n
-        var_x = sum((x - x_bar) ** 2 for x in xs)
-        beta = (
-            sum((x - x_bar) * (y - y_bar) for x, y in zip(xs, ys)) / var_x
-            if var_x > 0
-            else 0.0
-        )
-        alpha = y_bar - beta * x_bar
-        res = [y - (alpha + beta * x) for x, y in zip(xs, ys)]
-        std_res = math.sqrt(sum(e**2 for e in res) / n)
-        med_y = statistics.median(ys)
+        xs: list[list[float]] = []
+        ys: list[float] = []
+        for s, pre in usable:
+            c_feat = (
+                math.log(pre / s[1])
+                if pre is not None and pre > 0
+                else 0.0
+            )
+            xs.append([1.0, math.log(s[1]), c_feat])
+            ys.append(math.log(s[h] / s[1]))
+        beta = solve_ols_3(xs, ys)
+        if beta is not None:
+            n = len(ys)
+            res = [
+                y - (beta[0] + beta[1] * x[1] + beta[2] * x[2])
+                for x, y in zip(xs, ys)
+            ]
+            std_res = math.sqrt(sum(e**2 for e in res) / n)
+            med_y = statistics.median(ys)
+            x1_vals = [x[1] for x in xs]
+            x_min, x_max = min(x1_vals), max(x1_vals)
+            log_p1 = math.log(p1)
+            clamped_x = max(x_min, min(x_max, log_p1))
+            t_feat = (
+                math.log(target_pre23 / p1)
+                if target_pre23 is not None and target_pre23 > 0
+                else 0.0
+            )
+            fit_val = beta[0] + beta[1] * clamped_x + beta[2] * t_feat
+            pred = (
+                0.70 * fit_val + 0.30 * med_y
+                if (log_p1 < x_min or log_p1 > x_max)
+                else fit_val
+            )
+            pred_lr = max(min(ys), min(max(ys), pred))
+            spread = max(0.25, min(0.9, std_res * 0.85))
+            fit_ok = True
 
-        x_min, x_max = min(xs), max(xs)
-        log_p1 = math.log(p1)
-        clamped_x = max(x_min, min(x_max, log_p1))
-        fit_val = alpha + beta * clamped_x
-        pred = (
-            0.70 * fit_val + 0.30 * med_y
-            if (log_p1 < x_min or log_p1 > x_max)
-            else fit_val
-        )
-        pred_lr = max(min(ys), min(max(ys), pred))
-        spread = max(0.25, min(0.9, std_res))
-    else:
+    if not fit_ok:
         fb = [s for s in fallback if h in s]
         if fb:
             pred_lr = statistics.median([math.log(s[h] / s[1]) for s in fb])
@@ -145,16 +214,30 @@ def forecast_hour(
 def forecast_case(case_data: dict) -> dict:
     """Generate the full 23-hour forecast for a case.
 
-    Robustly ensures all hours 2 through 24 are evaluated in strictly increasing order,
-    matching required forecast hour targets while guarding against omissions.
+    Iterates through hours 2 to 24 in strictly increasing order, applying the
+    pre23 ratio feature and 0.85 residual spread shrinkage.
     """
-    p1, primary, fallback = collect_comparables(case_data)
-    req_hours = sorted({r.get("hour") for r in case_data.get("forecast", []) if isinstance(r.get("hour"), int)})
-    target_hours = req_hours if req_hours == list(range(2, 25)) else list(range(2, 25))
+    p1, target_pre23, primary, fallback = collect_comparables(case_data)
+    req_hours = sorted(
+        {
+            r.get("hour")
+            for r in case_data.get("forecast", [])
+            if isinstance(r.get("hour"), int)
+        }
+    )
+    target_hours = (
+        req_hours if req_hours == list(range(2, 25)) else list(range(2, 25))
+    )
     hours = [
-        {"hour": h, "q": forecast_hour(h, p1, primary, fallback)}
+        {
+            "hour": h,
+            "q": forecast_hour(h, p1, target_pre23, primary, fallback),
+        }
         for h in target_hours
     ]
+    hours.sort(key=lambda r: r["hour"])
+    if len(hours) != 23:
+        raise ValueError(f"Expected exactly 23 forecast hours, got {len(hours)}")
     return {"hours": hours}
 
 
